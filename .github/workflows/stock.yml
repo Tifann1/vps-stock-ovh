@@ -1,0 +1,68 @@
+# Surveille le stock du VPS-2 2027 d'OVHcloud dans les centres français et envoie une
+# notification sur le téléphone (app ntfy) dès qu'il est commandable.
+#
+# On interroge directement l'API publique d'OVHcloud (celle que lit vps-in-stock.ovh), sans
+# compte. Le nom du canal ntfy est dans le secret NTFY_TOPIC : quiconque le connaît peut lire
+# et écrire dans le canal, donc il ne doit pas apparaître dans le dépôt.
+#
+# Pas de mémoire entre deux passages : tant que le stock est là, chaque passage relance la
+# notification. C'est voulu, une alerte ratée coûte plus cher qu'une alerte en double.
+
+name: Stock VPS OVH
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # toutes les 10 min (GitHub peut retarder de 5 à 15 min)
+  workflow_dispatch:
+    inputs:
+      essai:
+        description: "Envoyer une notification d'essai même sans stock"
+        type: boolean
+        default: false
+
+jobs:
+  verifier:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    env:
+      PLAN: vps-2027-model2           # VPS-2 gamme 2027
+      CENTRES: "gra|rbx|sbg"          # Gravelines, Roubaix, Strasbourg
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+      ESSAI: ${{ inputs.essai }}
+    steps:
+      - name: Interroger OVHcloud et prévenir
+        run: |
+          set -euo pipefail
+          reponse=$(curl -sf --retry 3 --max-time 20 \
+            "https://eu.api.ovh.com/v1/vps/order/rule/datacenter?ovhSubsidiary=FR&planCode=$PLAN")
+
+          # Un centre compte comme disponible dès que l'offre Linux n'est plus en rupture.
+          dispo=$(echo "$reponse" | jq -r --arg c "$CENTRES" '
+            [.datacenters[]
+              | select(.code | test("eu-west-(" + $c + ")$"))
+              | select(.linuxStatus != "out-of-stock")
+              | .datacenter] | join(", ")')
+
+          echo "$reponse" | jq -r '.datacenters[] | "\(.datacenter)\t\(.linuxStatus)"'
+
+          if [ -n "$dispo" ]; then
+            titre="VPS-2 en stock chez OVH !"
+            message="Disponible à : $dispo. Commande vite, le stock part en quelques minutes."
+            priorite=5
+          elif [ "$ESSAI" = "true" ]; then
+            titre="Essai : surveillance VPS active"
+            message="Tout fonctionne. VPS-2 toujours en rupture en France."
+            priorite=3
+          else
+            echo "Toujours en rupture en France."
+            exit 0
+          fi
+
+          # Publication en JSON : les en-têtes HTTP n'acceptent pas les accents du titre.
+          jq -n --arg topic "$NTFY_TOPIC" --arg title "$titre" --arg message "$message" \
+                --argjson priority "$priorite" '{
+              topic: $topic, title: $title, message: $message, priority: $priority,
+              tags: ["rotating_light"],
+              click: "https://www.ovhcloud.com/fr/vps/"
+            }' | curl -sf --max-time 20 -H "Content-Type: application/json" -d @- https://ntfy.sh/
+          echo "Notification envoyée : $titre"
